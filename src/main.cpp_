@@ -1,0 +1,185 @@
+#include <Arduino.h>
+#include "driver/rmt_rx.h"
+#include "esp_log.h"
+
+// ── Config ────────────────────────────────────────────────────────────────
+#define RX_GPIO          GPIO_NUM_8
+#define RMT_RESOLUTION   1000000      // 1 tick = 1 µs
+#define BIT_US           208          // 1 bit @ 4800 bauds
+#define HALF_BIT_US      104          // tolérance ±50%
+#define MAX_SYMBOLS      256          // max symboles RMT par réception
+#define IDLE_THRESH_US   5000         // silence > 5ms = fin de trame
+
+static rmt_channel_handle_t    rx_chan  = NULL;
+static QueueHandle_t           rmt_q;
+static rmt_symbol_word_t       rx_buf[MAX_SYMBOLS];
+
+// ── Callback ISR ─────────────────────────────────────────────────────────
+static bool IRAM_ATTR rmt_cb(rmt_channel_handle_t ch,
+                              const rmt_rx_done_event_data_t *edata,
+                              void *ctx)
+{
+    BaseType_t wake = pdFALSE;
+    // on copie juste le descripteur (pointeur + count), pas les données
+    xQueueSendFromISR((QueueHandle_t)ctx, edata, &wake);
+    return wake == pdTRUE;
+}
+
+// ── Arrondir durée → nombre de bits ──────────────────────────────────────
+static int dur_to_bits(uint32_t us)
+{
+    return (int)((us + HALF_BIT_US) / BIT_US);
+}
+
+// ── Décode + affiche fronts et bits ──────────────────────────────────────
+static void decode_frame(const rmt_rx_done_event_data_t *ev)
+{
+    const rmt_symbol_word_t *s   = ev->received_symbols;
+    size_t                   n   = ev->num_symbols;
+
+    Serial.printf("\n=== Trame RMT : %u symboles ===\n", (unsigned)n);
+    Serial.printf("%-4s  %-8s  %-10s  %-6s  %s\n",
+                  "sym#", "niveau", "durée(µs)", "bits", "représentation");
+    Serial.println("----  --------  ----------  ------  ---------------");
+
+    // Chaque symbol RMT contient deux intervalles :
+    //   level0/duration0  puis  level1/duration1
+    // duration == 0 → invalide / fin de stream
+    int sym_idx = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        // ── Intervalle A ─────────────────────────────────────────────────
+        if (s[i].duration0 > 0) {
+            int lvl  = s[i].level0;
+            uint32_t dur = s[i].duration0;
+            int nb   = dur_to_bits(dur);
+            char bar[64] = {0};
+            int fill = (nb > 60) ? 60 : nb;
+            memset(bar, lvl ? 'H' : 'L', fill);
+            Serial.printf("%-4d  %-8s  %-10lu  %-6d  %s\n",
+                          sym_idx++,
+                          lvl ? "HIGH" : "LOW ",
+                          (unsigned long)dur,
+                          nb,
+                          bar);
+        }
+        // ── Intervalle B ─────────────────────────────────────────────────
+        if (s[i].duration1 > 0) {
+            int lvl  = s[i].level1;
+            uint32_t dur = s[i].duration1;
+            int nb   = dur_to_bits(dur);
+            char bar[64] = {0};
+            int fill = (nb > 60) ? 60 : nb;
+            memset(bar, lvl ? 'H' : 'L', fill);
+            Serial.printf("%-4d  %-8s  %-10lu  %-6d  %s\n",
+                          sym_idx++,
+                          lvl ? "HIGH" : "LOW ",
+                          (unsigned long)dur,
+                          nb,
+                          bar);
+        }
+    }
+
+    // ── Tentative de décodage 9-bits SeaTalk ─────────────────────────────
+    // On reconstruit le flux de bits bruts depuis les symboles
+    Serial.println("\n--- Bits bruts (start/data×8/cmd/stop par groupe) ---");
+
+    // Tableau plat de bits
+    static uint8_t bits[512];
+    int  bit_count = 0;
+
+    for (size_t i = 0; i < n && bit_count < 511; i++) {
+        auto push = [&](int lvl, uint32_t dur) {
+            int nb = dur_to_bits(dur);
+            for (int k = 0; k < nb && bit_count < 511; k++)
+                bits[bit_count++] = lvl ? 1 : 0;
+        };
+        if (s[i].duration0 > 0) push(s[i].level0, s[i].duration0);
+        if (s[i].duration1 > 0) push(s[i].level1, s[i].duration1);
+    }
+
+    // UART idle = HIGH ; start bit = LOW (premier front descendant)
+    // Cherche chaque start bit (0) et extrait 11 bits : start(1) + data(8) + cmd(1) + stop(1)
+    int pos = 0;
+    int byte_idx = 0;
+    while (pos < bit_count) {
+        // cherche start bit LOW
+        if (bits[pos] != 0) { pos++; continue; }
+        if (pos + 11 > bit_count) break;   // pas assez de bits
+
+        uint8_t val  = 0;
+        int     cmd  = 0;
+        // bits[pos]   = start (0)
+        // bits[pos+1..8] = data LSB first
+        for (int b = 0; b < 8; b++)
+            val |= (bits[pos + 1 + b] << b);
+        cmd = bits[pos + 9];                // 9ème bit = command bit SeaTalk
+        // bits[pos+10] = stop (1)
+
+        Serial.printf("  [octet %d]  raw=0x%02X (%3d)  cmd=%d  stop=%d  → %s\n",
+                      byte_idx,
+                      val, val,
+                      cmd,
+                      bits[pos + 10],
+                      byte_idx == 0 ? "COMMANDE" : "donnée  ");
+        byte_idx++;
+        pos += 11;
+    }
+    if (byte_idx == 0)
+        Serial.println("  (aucun octet décodé)");
+}
+
+// ── Setup ─────────────────────────────────────────────────────────────────
+void setup()
+{
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("\n\nESP32-S3 — Lecteur SeaTalk1 via RMT (GPIO5, 4800 bauds)");
+    Serial.println("==========================================================");
+
+    // File pour passer les événements ISR → loop()
+    rmt_q = xQueueCreate(4, sizeof(rmt_rx_done_event_data_t));
+
+    // ── Canal RMT RX ──────────────────────────────────────────────────────
+    rmt_rx_channel_config_t cfg = {};
+    cfg.gpio_num          = RX_GPIO;
+    cfg.clk_src           = RMT_CLK_SRC_DEFAULT;
+    cfg.resolution_hz     = RMT_RESOLUTION;       // 1 µs / tick
+    cfg.mem_block_symbols = MAX_SYMBOLS;
+    cfg.flags.invert_in   = false;                // SeaTalk idle = HIGH → pas d'inversion
+    cfg.flags.with_dma    = false;
+
+    ESP_ERROR_CHECK(rmt_new_rx_channel(&cfg, &rx_chan));
+
+    // ── Callbacks ─────────────────────────────────────────────────────────
+    rmt_rx_event_callbacks_t cbs = {};
+    cbs.on_recv_done = rmt_cb;
+    ESP_ERROR_CHECK(rmt_rx_register_event_callbacks(rx_chan, &cbs, rmt_q));
+
+    ESP_ERROR_CHECK(rmt_enable(rx_chan));
+
+    // ── Lancer la première réception ──────────────────────────────────────
+    rmt_receive_config_t rx_cfg = {};
+    rx_cfg.signal_range_min_ns = 1000;            //  1 µs  — filtre glitchs
+    rx_cfg.signal_range_max_ns = IDLE_THRESH_US * 1000; // 5 ms — fin de trame
+
+    ESP_ERROR_CHECK(rmt_receive(rx_chan, rx_buf, sizeof(rx_buf), &rx_cfg));
+
+    Serial.println("En attente de signal sur GPIO5...\n");
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────
+void loop()
+{
+    rmt_rx_done_event_data_t ev;
+
+    if (xQueueReceive(rmt_q, &ev, pdMS_TO_TICKS(100)) == pdTRUE) {
+        decode_frame(&ev);
+
+        // Relancer immédiatement la réception
+        rmt_receive_config_t rx_cfg = {};
+        rx_cfg.signal_range_min_ns = 1000;
+        rx_cfg.signal_range_max_ns = IDLE_THRESH_US * 1000;
+        rmt_receive(rx_chan, rx_buf, sizeof(rx_buf), &rx_cfg);
+    }
+}

@@ -3,6 +3,13 @@
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 
+
+// A METTRE DANS CONFIG
+#define SEATALK_BIT_US    208
+#define HALF_BIT_US       104
+#define IDLE_THRESHOLD_US 3000 // 3ms de silence pour séparer les messages
+
+
 typedef void (*seatalk_rx_callback_t)(uint8_t* data, int length);
 
 class SeatalkGPIO {
